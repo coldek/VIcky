@@ -359,6 +359,7 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "diagnostics")]
 #[derive(Default)]
 struct HeapTextureTiming {
+    lock_us: u64,
     remap_us: u64,
     queue_us: u64,
     scan_us: u64,
@@ -1560,25 +1561,19 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cached = host.buffer_ranges();
         #[cfg(feature = "diagnostics")]
         let ranges_locked = tick();
-        let (passes, ranges) = kept
-            .get_or_insert_with(Default::default)
-            .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let full_scan = *passes % 16 == 0;
+        let full_scan = cached.passes % 16 == 0;
+        cached.passes = cached.passes.wrapping_add(1);
+        let ranges = &mut cached.slots;
         let slots = if full_scan {
             ranges.clear();
             host.buffer_slots()
         } else {
             changed
         };
-        *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1629,7 +1624,7 @@ impl State {
             span.1 = span.1.min(*from);
             span.2 = span.2.max(*to);
         }
-        drop(kept);
+        drop(cached);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
@@ -1638,31 +1633,20 @@ impl State {
         // the garbage ended runs (the card stopped answering 14-90 frames
         // into the opening cutscene; with every frame it ran on). The pass
         // costs some 30 ms a frame this way.
-        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         #[cfg(feature = "diagnostics")]
         let spans_folded = tick();
-        let mut whole_guard = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-        #[cfg(feature = "diagnostics")]
-        let whole_locked = tick();
-        let whole = whole_guard.get_or_insert_with(Default::default);
+        // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
+        static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
-                // By the copy's number: a copy made where one let go was
-                // (`shadow::let_go_idle`) has never been refreshed.
-                let key = shadow.id() as usize;
-                // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
-                static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
                 let every = *EVERY.get_or_init(|| {
                     std::env::var("VICTORY_UNWATCHED_FRAMES")
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(1)
                 });
-                match whole.get(&key) {
-                    Some(&last) if frame < last + every => continue,
-                    _ => {
-                        whole.insert(key, frame);
-                    }
+                if !shadow.claim_heap_refresh(frame, every) {
+                    continue;
                 }
             }
             shadow.refresh(list, *from, to - from);
@@ -1693,10 +1677,9 @@ impl State {
                 "buffer views of the heap made ready for shaders that pick them by index"
             );
         }
-        drop(whole_guard);
         #[cfg(feature = "diagnostics")]
         if let Some(texture) = texture_timing {
-            // The three texture timings are included in `textures_us`.
+            // The texture subphases are included in `textures_us`.
             tracing::info!(
                 frame,
                 full_scan,
@@ -1704,12 +1687,12 @@ impl State {
                 views,
                 copies = spans.len(),
                 total_us = elapsed.as_micros() as u64,
-                ranges_lock_us = (ranges_locked - started).as_micros() as u64,
+                range_cache_lock_us = (ranges_locked - started).as_micros() as u64,
                 cache_slots_us = (slots_cached - ranges_locked).as_micros() as u64,
                 fold_spans_us = (spans_folded - slots_cached).as_micros() as u64,
-                whole_lock_us = (whole_locked - spans_folded).as_micros() as u64,
-                defer_refresh_us = (refresh_queued - whole_locked).as_micros() as u64,
+                defer_refresh_us = (refresh_queued - spans_folded).as_micros() as u64,
                 textures_us = (finished - refresh_queued).as_micros() as u64,
+                textures_lock_us = texture.lock_us,
                 textures_remap_us = texture.remap_us,
                 textures_queue_us = texture.queue_us,
                 textures_scan_us = texture.scan_us,
@@ -1744,6 +1727,16 @@ impl State {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
+        }
+        // A later frame can begin while a previous pass is still running.
+        // Serialize texture passes so their budgets and queue work cannot mix.
+        static PASS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        #[cfg(feature = "diagnostics")]
+        let lock_started = timing.as_ref().map(|_| std::time::Instant::now());
+        let _pass = PASS.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        if let (Some(timing), Some(lock_started)) = (timing.as_mut(), lock_started) {
+            timing.lock_us = lock_started.elapsed().as_micros() as u64;
         }
         /// Bytes of texture memory staged per frame.
         const PER_FRAME: u64 = 192 << 20;

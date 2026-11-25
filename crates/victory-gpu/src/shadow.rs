@@ -37,6 +37,8 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
+    /// The last frame a heap pass claimed an unwatched refresh, or `u64::MAX`.
+    last_heap_refresh: AtomicU64,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -1848,6 +1850,18 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Claims this unwatched copy for a heap pass once every `interval` frames.
+    pub(crate) fn claim_heap_refresh(&self, frame: u64, interval: u64) -> bool {
+        if interval == 0 {
+            return true;
+        }
+        self.last_heap_refresh
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                (last == u64::MAX || frame.saturating_sub(last) >= interval).then_some(frame)
+            })
+            .is_ok()
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -1942,6 +1956,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
+            last_heap_refresh: AtomicU64::new(u64::MAX),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -3750,6 +3765,49 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod heap_refresh_tests {
+    use super::*;
+
+    /// A copy without a registry or command list that could keep it alive.
+    fn isolated_copy() -> Option<Arc<Shadow>> {
+        let len = PAGE as u64;
+        let (buffer, data) = host()?.upload_buffer(len)?;
+        // SAFETY: the fresh, live buffer's address is a plain query.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some(Arc::new(Shadow::new(buffer, data, gpu, 0, len)))
+    }
+
+    #[test]
+    fn dropping_a_host_heap_releases_cached_shadows() {
+        let Some(copy) = isolated_copy() else { return };
+        let heap = crate::descriptor::host::HostHeap::new(false, 4).expect("a host view heap");
+        let weak = Arc::downgrade(&copy);
+        let (start, len) = copy.span();
+        heap.buffer_ranges().slots.insert(0, (copy, start, start + len));
+        assert_eq!(weak.strong_count(), 1, "the heap cache is the sole owner");
+        drop(heap);
+        assert!(weak.upgrade().is_none(), "the cache's copy went with the heap");
+    }
+
+    #[test]
+    fn unwatched_heap_refresh_interval_is_per_copy() {
+        let Some(copy) = isolated_copy() else { return };
+        assert!(copy.claim_heap_refresh(0, 1));
+        assert!(!copy.claim_heap_refresh(0, 1));
+        assert!(copy.claim_heap_refresh(1, 1));
+        assert!(!copy.claim_heap_refresh(2, 2));
+        assert!(copy.claim_heap_refresh(3, 2));
+        assert!(!copy.claim_heap_refresh(2, 1), "a late older pass cannot move the deadline back");
+        assert!(!copy.claim_heap_refresh(4, u64::MAX), "a large interval cannot overflow");
+        assert!(copy.claim_heap_refresh(3, 0) && copy.claim_heap_refresh(3, 0));
+
+        let fresh = isolated_copy().expect("a second isolated copy");
+        assert_eq!(copy.span(), fresh.span());
+        assert!(fresh.claim_heap_refresh(3, u64::MAX), "a new copy is due immediately");
+    }
 }
 
 #[cfg(test)]

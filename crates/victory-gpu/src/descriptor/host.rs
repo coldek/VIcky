@@ -86,6 +86,8 @@ pub(crate) struct HostHeap {
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
+    /// Copies and ranges from the last pass over this heap's buffer views.
+    buffer_ranges: Mutex<BufferRanges>,
     /// Title slots holding a view of a texture the title may fill itself (a
     /// placed texture, a texture object), with the frame from which they
     /// are due: such a texture is uploaded when a draw reads it through a
@@ -110,6 +112,13 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: Mutex<Spans>,
+}
+
+/// The recording pass's cached copy and range for each buffer view.
+#[derive(Default)]
+pub(crate) struct BufferRanges {
+    pub(crate) passes: u64,
+    pub(crate) slots: std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
 }
 
 /// Host-slot state behind one lock: every write of a host slot for a title
@@ -899,6 +908,7 @@ impl HostHeap {
             strides,
             buffers: Mutex::default(),
             changed: Mutex::default(),
+            buffer_ranges: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { titled })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -1410,6 +1420,11 @@ impl HostHeap {
     pub(crate) fn buffer_changes(&self) -> Vec<u32> {
         let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *changed).into_iter().collect()
+    }
+
+    /// The buffer-view cache, owned by the heap so its copies can go when the heap goes.
+    pub(crate) fn buffer_ranges(&self) -> std::sync::MutexGuard<'_, BufferRanges> {
+        self.buffer_ranges.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Records what title slot `index` now holds for shaders that pick
