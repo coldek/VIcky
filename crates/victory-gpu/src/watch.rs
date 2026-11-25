@@ -22,6 +22,7 @@
 //! (none is known to).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Mutex;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
@@ -32,17 +33,16 @@ pub(crate) const PAGE: usize = 64 << 10;
 const KERNEL_PAGE: usize = 4096;
 
 struct Journal {
-    /// Numbers the askings; 0 is "never".
+    /// Numbers the askings and mapping changes; 0 is "never".
     asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    remapped: Remaps,
     /// Room for the kernel's answer.
     found: Vec<usize>,
-    /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
-    /// and the asking that did: `writes` answers for a range inside one
-    /// from the journal, without another kernel call.
+    /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`]):
+    /// `writes` answers for a range inside one from the journal.
     ahead: Vec<(usize, usize)>,
-    ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
@@ -52,11 +52,136 @@ struct Journal {
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
+    remapped: Remaps(BTreeMap::new()),
     found: Vec::new(),
     ahead: Vec::new(),
-    ahead_asked: 0,
     kept: false,
 });
+
+/// Disjoint remapped page ranges and their generations, keyed by start page.
+/// Even an uncommitted reservation can still answer `GetWriteWatch` without
+/// reporting a write. Keep its mapping change independently of the old data's
+/// write stamps so every reader can see it.
+struct Remaps(BTreeMap<usize, (usize, u64)>);
+
+const MAX_REMAP_RANGES: usize = 8 * 1024;
+
+impl Remaps {
+    fn record(&mut self, range: Range<usize>, now: u64) {
+        let start = range.start;
+        let end = range.end;
+        if let Some((to, stamp)) = self.0.range_mut(..start).next_back().map(|(_, r)| r)
+            && *to > start
+        {
+            let (old_end, old_stamp) = (*to, *stamp);
+            *to = start;
+            if old_end > end {
+                self.0.insert(end, (old_end, old_stamp));
+            }
+        }
+        while let Some((&from, &(to, stamp))) = self.0.range(range.clone()).next() {
+            self.0.remove(&from);
+            if to > end {
+                self.0.insert(end, (to, stamp));
+            }
+        }
+        self.0.insert(start, (end, now));
+        if self.0.len() > MAX_REMAP_RANGES {
+            self.compact();
+        }
+    }
+
+    fn compact(&mut self) {
+        // Pair adjacent older ranges so the newest quarter retain their
+        // boundaries. Use the later stamp over each pair and its gap so
+        // older readers can never miss a change. Removing at least a
+        // quarter of the entries amortizes this pass over later remaps.
+        let mut stamps: Vec<_> = self.0.values().map(|&(_, stamp)| stamp).collect();
+        let cutoff = stamps.len() * 3 / 4;
+        let newest = *stamps.select_nth_unstable(cutoff).1;
+        let mut previous: Option<(usize, u64)> = None;
+        let mut merged = Vec::new();
+        self.0.retain(|&from, &mut (to, stamp)| {
+            if stamp > newest {
+                previous = None;
+                return true;
+            }
+            if let Some((start, earlier)) = previous.take() {
+                merged.push((start, (to, earlier.max(stamp))));
+                return false;
+            }
+            previous = Some((from, stamp));
+            true
+        });
+        self.0.extend(merged);
+    }
+
+    fn within(&self, first: usize, last: usize) -> impl Iterator<Item = (Range<usize>, u64)> + '_ {
+        self.0
+            .range(..first)
+            .next_back()
+            .filter(|&(_, &(end, _))| end > first)
+            .into_iter()
+            .chain(self.0.range(first..last))
+            .map(move |(&from, &(to, stamp))| (from.max(first)..to.min(last), stamp))
+    }
+}
+
+/// The write and mapping changes known after an asking. Remaps stay as
+/// ranges even when a large reservation changes in a single call.
+pub(crate) struct Changes {
+    pub(crate) now: u64,
+    written: Vec<(usize, u64)>,
+    remapped: Vec<(Range<usize>, u64)>,
+}
+
+impl Journal {
+    fn changes(&self, first: usize, last: usize) -> Changes {
+        Changes {
+            now: self.asked,
+            written: self
+                .written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+            remapped: self.remapped.within(first, last).collect(),
+        }
+    }
+}
+
+impl Changes {
+    pub(crate) fn changed_since(&self, at: u64) -> bool {
+        self.written.iter().any(|&(_, stamp)| stamp > at)
+            || self.remapped.iter().any(|&(_, stamp)| stamp > at)
+    }
+
+    pub(crate) fn remapped_since(&self, page: usize, at: u64) -> bool {
+        let i = self.remapped.partition_point(|(range, _)| range.end <= page);
+        self.remapped
+            .get(i)
+            .is_some_and(|(range, stamp)| range.contains(&page) && *stamp > at)
+    }
+
+    /// Pages in address order, with the later of their write and remap stamps.
+    pub(crate) fn pages(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        let mut written = self.written.iter().copied().peekable();
+        let mut remapped = self
+            .remapped
+            .iter()
+            .flat_map(|(range, stamp)| range.clone().map(move |page| (page, *stamp)))
+            .peekable();
+        std::iter::from_fn(move || match (written.peek().copied(), remapped.peek().copied()) {
+            (Some((page, w)), Some((p, r))) if page == p => {
+                written.next();
+                remapped.next();
+                Some((page, w.max(r)))
+            }
+            (Some((page, _)), Some((p, _))) if page < p => written.next(),
+            (_, Some(_)) => remapped.next(),
+            _ => written.next(),
+        })
+    }
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -90,7 +215,6 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     j.asked += 1;
-    j.ahead_asked = j.asked;
     j.ahead.clear();
     let mut i = 0;
     while i < pieces.len() {
@@ -178,11 +302,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     ask_ahead(ranges);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
-    if j.ahead.is_empty() {
-        // `ask_ahead` asked nothing (fewer than two ranges).
-        j.asked += 1;
-        j.ahead_asked = j.asked;
-    }
+    // Another reader or remap may have advanced the journal since
+    // `ask_ahead` released the lock. The remaining asks get a new stamp.
+    j.asked += 1;
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
     // such range asked again at each of its 70 flushes (run 76: 2,300
@@ -257,7 +379,7 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 }
 
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
-/// them in the journal under the ahead asking; false (and nothing changed)
+/// them in the journal under the current asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
@@ -288,7 +410,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
-    let now = j.ahead_asked;
+    let now = j.asked;
     for k in 0..count {
         let page = j.found[k] / PAGE;
         j.written.insert(page, now);
@@ -298,32 +420,24 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
 /// the range lies in one asked ahead ([`ask_ahead`], [`ask_once`]): the
-/// pages written since tracking began and the asking that last found each
-/// written, with the number of the asking that stands (as [`writes`] gives
-/// it). `None` if the kernel would have to be asked.
-pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+/// write and mapping changes known to the current asking. `None` if the
+/// kernel would have to be asked.
+pub(crate) fn asked(start: usize, end: usize) -> Option<Changes> {
+    if start >= end {
+        return None;
+    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| {
-            (
-                j.asked,
-                j.written
-                    .range(first..last)
-                    .map(|(&p, &w)| (p, w))
-                    .collect(),
-            )
-        })
+        .then(|| j.changes(first, last))
 }
 
-/// The pages of `[start, end)` (whole pages) as last written, for pages
-/// written since tracking began: `(page number, asking)` in page order, and
-/// this asking's number, which is higher than any in the list but those the
-/// kernel just reported. `None` if the memory is not write-watched (nor,
-/// with `guarded`, view memory, which is then guarded).
-pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+/// The changes of `[start, end)` (whole pages) known after this asking.
+/// `None` if the memory is neither write-watched nor, with `guarded`, view
+/// memory that can be guarded.
+pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<Changes> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     if start >= end {
@@ -334,13 +448,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some(j.changes(first, last));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -388,13 +496,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some(j.changes(first, last))
 }
 
 /// Guarded blocks of view memory.
@@ -852,25 +954,27 @@ pub fn title_memory_reading_now() -> Option<Reading> {
     }
 }
 
-/// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded (nor known
-/// unmapped).
+/// The runtime changed the mapping of `[at, at + len)`. Discard guard
+/// state for the old mapping and publish the change to readers.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    unmap_title_memory(at, len, || {});
+}
+
+/// Retires in-place views before the supplied unmap and publishes the
+/// resulting mapping change afterward. The runtime also holds
+/// [`title_memory_remapping`] across the full mapping change.
+pub fn unmap_title_memory(at: usize, len: usize, unmap: impl FnOnce()) {
     if len == 0 {
+        unmap();
         return;
     }
-    // A placed texture there arrives, goes or changes with no descriptor
-    // written.
-    crate::descriptor::host::remapped(at, len);
-    // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
-    // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    unmap();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    // Discard the old mapping's journal entries and cached kernel asks.
-    // The next guarded read records the new mapping as a change. Take
-    // both locks in the order used by writes so that read cannot race
-    // the reset.
+    // A query racing the unmap can see the old generation. Publish the new
+    // generation only after the unmap and discard the old mapping's write
+    // stamps and cached asks under both locks, in the order used by writes.
     let mut journal = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut g = guards();
     let stale_writes: Vec<_> = journal
@@ -881,6 +985,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for page in stale_writes {
         journal.written.remove(&page);
     }
+    journal.asked += 1;
+    let now = journal.asked;
+    journal.remapped.record(range.clone(), now);
     journal
         .ahead
         .retain(|&(from, to)| to <= range.start || range.end <= from);
@@ -907,6 +1014,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             }
         }
     }
+    drop(g);
+    drop(journal);
+    // A placed texture there arrives, goes or changes with no descriptor
+    // written.
+    crate::descriptor::host::remapped(at, len);
 }
 
 /// Reports all known virtual mappings of the same physical page.
@@ -1033,10 +1145,10 @@ impl Tracked {
             return Vec::new();
         }
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((now, written)) = writes(from, to, self.views) else {
+        let Some(changes) = writes(from, to, self.views) else {
             return vec![(from, to)];
         };
-        let mut written = written.into_iter().peekable();
+        let mut written = changes.pages().peekable();
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         for p in from / PAGE..to.div_ceil(PAGE) {
             let last_write = written
@@ -1052,7 +1164,7 @@ impl Tracked {
             );
             if a <= (p * PAGE).max(self.start) && b >= (p * PAGE).saturating_add(PAGE).min(self.end)
             {
-                *stamp = now;
+                *stamp = changes.now;
             }
             match ranges.last_mut() {
                 Some((_, end)) if *end == a => *end = b,
@@ -1115,16 +1227,20 @@ pub(crate) mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        title_memory_remapped(start, end - start);
+        let before = writes(start, end, false).expect("watched");
+        assert!(before.written.is_empty());
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
-        let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        let after = writes(start, end, false).expect("watched");
+        assert_eq!(after.written, [(p / PAGE + 1, after.now)]);
         // Another asker after the kernel's bit was cleared still sees it.
-        let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
-        assert!(later > now);
-        assert_eq!(again, [(p / PAGE + 1, now)]);
+        let again = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
+        assert!(again.now > after.now);
+        assert_eq!(
+            again.pages().collect::<Vec<_>>(),
+            [(p / PAGE + 1, after.now)]
+        );
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(
@@ -1134,8 +1250,78 @@ pub(crate) mod tests {
             )
             .is_none()
         );
+        title_memory_remapped(start, end - start);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn remapped_write_watch_pages_stay_changed_for_each_tracker() {
+        use windows_sys::Win32::System::Memory::MEM_DECOMMIT;
+
+        let p = pool(3);
+        let (middle, end) = (p + PAGE, p + 3 * PAGE);
+        // SAFETY: materialize this test's committed pages before tracking.
+        unsafe { (p as *mut u8).write_bytes(0, 3 * PAGE) };
+        let first = track(p, 3 * PAGE, false).expect("watched");
+        let second = track(p, 3 * PAGE, false).expect("watched");
+        for tracker in [&first, &second] {
+            assert_eq!(tracker.take(p, end), [(p, end)]);
+            assert!(tracker.take(p, end).is_empty());
+        }
+        // SAFETY: the test owns this committed page and its reservation.
+        unsafe { ((middle + 8) as *mut u8).write_volatile(1) };
+        assert_eq!(
+            first.take(middle + 8, middle + 9),
+            [(middle + 8, middle + 9)]
+        );
+        {
+            let _changing = title_memory_remapping();
+            unmap_title_memory(middle, PAGE, || {
+                // SAFETY: the test still owns the reservation.
+                assert_ne!(
+                    unsafe { VirtualFree(middle as *mut _, PAGE, MEM_DECOMMIT) },
+                    0
+                );
+            });
+        }
+        for tracker in [&first, &second] {
+            assert!(tracker.take(p, middle).is_empty());
+            assert!(tracker.take(middle + PAGE, end).is_empty());
+            assert_eq!(tracker.take(p, end), [(middle, middle + PAGE)]);
+            assert!(tracker.take(p, end).is_empty());
+        }
+        title_memory_remapped(p, end - p);
+        free(p);
+    }
+
+    #[test]
+    fn remap_history_preserves_overlaps_and_bounds_older_ranges() {
+        let mut remaps = Remaps(BTreeMap::new());
+        remaps.record(10..40, 1);
+        remaps.record(20..30, 2);
+        remaps.record(25..35, 3);
+        assert_eq!(
+            remaps.within(15, 38).collect::<Vec<_>>(),
+            [(15..20, 1), (20..25, 2), (25..35, 3), (35..38, 1)]
+        );
+
+        let start = 50;
+        for i in 0..MAX_REMAP_RANGES {
+            let page = start + i * 2;
+            remaps.record(page..page + 1, i as u64 + 4);
+        }
+        assert!(remaps.0.len() <= MAX_REMAP_RANGES);
+        for i in 0..MAX_REMAP_RANGES {
+            let page = start + i * 2;
+            let stamp = i as u64 + 4;
+            assert!(remaps.within(page, page + 1).any(|(_, at)| at >= stamp));
+        }
+        let last = start + (MAX_REMAP_RANGES - 1) * 2;
+        assert_eq!(
+            remaps.within(last - 1, last + 2).collect::<Vec<_>>(),
+            [(last..last + 1, MAX_REMAP_RANGES as u64 + 3)]
+        );
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

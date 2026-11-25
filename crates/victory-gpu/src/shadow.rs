@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
-use crate::watch::PAGE;
+use crate::watch::{Changes, PAGE};
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -2482,9 +2482,9 @@ impl Shadow {
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
     /// title bytes behind: a range shaders may be writing holds a page the
-    /// title wrote since the copy last took it. The answer comes from the
-    /// write-watch journal alone, as the submission's one asking left it
-    /// (`crate::watch::asked`); where the journal cannot say (memory not
+    /// title wrote or remapped since the copy last took it. The answer comes
+    /// from the write-watch journal alone, as the submission's one asking
+    /// left it (`crate::watch::asked`); where the journal cannot say (memory not
     /// write-watched, a range not asked about) it is yes. A page the copy
     /// never took whole counts as written if the title ever wrote it.
     ///
@@ -2515,7 +2515,7 @@ impl Shadow {
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter()
             .any(|(a, e)| match crate::watch::asked(a, e) {
-                Some((_, written)) => written.into_iter().any(|(page, write)| {
+                Some(changes) => changes.pages().any(|(page, write)| {
                     page >= base
                         && copied
                             .get(page - base)
@@ -2575,23 +2575,20 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let Some(changes) = crate::watch::writes(a, e, true) else {
                 return true;
             };
-            let stale: Vec<usize> = {
+            let stale: Vec<_> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                written
-                    .into_iter()
-                    .filter(|&(page, write)| {
-                        page >= base
-                            && copied
-                                .get(page - base)
-                                .is_none_or(|&at| at == 0 || write > at)
+                changes
+                    .pages()
+                    .filter_map(|(page, write)| {
+                        let copied_at = copied[page - base];
+                        (copied_at == 0 || write > copied_at).then_some((page, copied_at))
                     })
-                    .map(|(page, _)| page)
                     .collect()
             };
-            for page in stale {
+            for (page, copied_at) in stale {
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
                 if lo >= hi {
                     continue;
@@ -2607,9 +2604,13 @@ impl Shadow {
                 // such a merge and compared after it would take the card's
                 // bytes for the title's.
                 let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-                // A page that is not there is left as it is, and looked at
-                // again next time.
+                // A remapped page that cannot be read needs a settle so
+                // the ordinary refresh can copy its remaining bytes and
+                // fill holes with zero.
                 if !crate::host::read_into(lo as *const u8, title) {
+                    if changes.remapped_since(page, copied_at) {
+                        return true;
+                    }
                     continue;
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
@@ -2661,7 +2662,7 @@ impl Shadow {
                 if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
+                        *at = changes.now;
                     }
                 }
             }
@@ -2744,11 +2745,11 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return 0;
         }
-        let Some((now, written)) = crate::watch::writes(from, to, true) else {
+        let Some(changes) = crate::watch::writes(from, to, true) else {
             return 0;
         };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        self.copy_stale(from, to, now, &written, |a, b| {
+        self.copy_stale(from, to, &changes, |a, b| {
             let copied = self.copy(a, b);
             if let Some(snapshot) = before.as_mut() {
                 let offset = a - self.start as usize;
@@ -2770,9 +2771,9 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some(changes) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written, |a, b| self.copy(a, b));
+                let copied = self.copy_stale(from, to, &changes, |a, b| self.copy(a, b));
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -2793,37 +2794,30 @@ impl Shadow {
         to - from
     }
 
-    /// Copies the pages of `[from, to)` written after their last copy
-    /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
+    /// Copies the pages of `[from, to)` changed after their last copy.
     fn copy_stale(
         &self,
         from: usize,
         to: usize,
-        now: u64,
-        written: &[(usize, u64)],
+        changes: &Changes,
         mut copy: impl FnMut(usize, usize) -> usize,
     ) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut writes = written.iter().peekable();
+        let mut writes = changes.pages().peekable();
         let (mut bytes, mut run) = (0, None);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
-                }
-                _ => 0,
-            };
+            let write = writes
+                .next_if(|&(p, _)| p == page)
+                .map_or(0, |(_, stamp)| stamp);
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
+                    *at = changes.now;
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {

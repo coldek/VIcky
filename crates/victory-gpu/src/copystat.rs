@@ -159,6 +159,8 @@ pub(crate) enum C {
     /// checks); time in each kind of step (a step that flushes the batch
     /// counts that too); texture uploads for heaps; state preludes.
     FlushUs,
+    /// Unrequested gap bytes excluded from pending buffer refreshes.
+    RefreshGaps,
     StepRefreshUs,
     StepCopyUs,
     StepWorkUs,
@@ -1148,6 +1150,10 @@ pub(crate) fn log(frames: f64) {
         .collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
+    tracing::info!(
+        "disjoint shadow refreshes: {:.3} MB of gaps excluded per frame",
+        mb(c[C::RefreshGaps as usize])
+    );
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \

@@ -929,17 +929,18 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
-        // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
-        };
+        victory_gpu::unmap_title_memory(at, size, || {
+            // SAFETY: a view we mapped; it becomes a placeholder again.
+            unsafe {
+                UnmapViewOfFile2(
+                    GetCurrentProcess(),
+                    MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: at as *mut c_void,
+                    },
+                    MEM_PRESERVE_PLACEHOLDER,
+                );
+            }
+        });
         if at < base {
             map(physical, at, base - at, slice.clone());
         }

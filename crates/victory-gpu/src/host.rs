@@ -5864,9 +5864,13 @@ fn wide_refresh() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+mod refresh;
+use refresh::RefreshRanges;
+
+type ShadowRefresh = (std::sync::Arc<crate::shadow::Shadow>, RefreshRanges);
+
+/// A submission refreshes the requested ranges of each copy before a step
+/// writes title memory or gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -5880,30 +5884,34 @@ fn wide_refresh() -> bool {
 /// GPU).
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<ShadowRefresh>,
     /// Where each copy's refresh is in `refreshes`, by copy.
     index: std::collections::HashMap<usize, usize>,
-    /// The range of each copy brought up to date since the last title
+    /// The merged ranges of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    current: std::collections::HashMap<usize, ShadowRefresh>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        let range = (address, address.saturating_add(len));
+        if range.0 >= range.1
+            || self
+                .current
+                .get(&key)
+                .is_some_and(|(_, ranges)| ranges.covers(range))
+        {
             return;
         }
         match self.index.get(&key) {
-            Some(&i) => {
-                let (_, from, to) = &mut self.refreshes[i];
-                (*from, *to) = ((*from).min(address), (*to).max(end));
-            }
+            Some(&i) => self.refreshes[i].1.add(range),
             None => {
                 self.index.insert(key, self.refreshes.len());
-                self.refreshes.push((shadow.clone(), address, end));
+                self.refreshes
+                    .push((shadow.clone(), RefreshRanges::One(range)));
             }
         }
     }
@@ -5911,15 +5919,36 @@ impl Batch {
     /// Before shaders are given a range of `shadow`'s copy: its pending
     /// refresh is done, the others stay pending.
     fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
-        let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
+        let Some(at) = self
+            .index
+            .remove(&(std::sync::Arc::as_ptr(shadow) as usize))
+        else {
             return;
         };
-        let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let (shadow, mut ranges) = self.refreshes.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
-            self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
+            self.index
+                .insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
+        ranges.merge();
+        Self::update_ranges(&shadow, &ranges);
+    }
+
+    fn update_ranges(shadow: &crate::shadow::Shadow, ranges: &RefreshRanges) -> usize {
+        let ranges = ranges.slices();
+        #[cfg(feature = "diagnostics")]
+        if ranges.len() > 1 {
+            let gaps = ranges
+                .windows(2)
+                .map(|pair| pair[1].0 - pair[0].1)
+                .sum::<usize>();
+            crate::copystat::add(crate::copystat::C::RefreshGaps, gaps as u64);
+        }
+        ranges
+            .iter()
+            .map(|&(from, to)| Self::update(shadow, from, to))
+            .sum()
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -5937,7 +5966,8 @@ impl Batch {
     /// Whether `staging` is still to be refreshed in this submission (and
     /// notes it refreshed).
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+        self.textures
+            .insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
     /// Before a step that writes title memory: pending refreshes are done
@@ -5953,14 +5983,18 @@ impl Batch {
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         let mut total = 0;
         self.index.clear();
-        for (shadow, from, to) in &self.refreshes {
+        for (shadow, ranges) in &mut self.refreshes {
+            ranges.merge();
             let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let (_, a, b) = self.current.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            if *from <= *b && *a <= *to {
-                (*a, *b) = ((*a).min(*from), (*b).max(*to));
-            } else if to - from > *b - *a {
-                (*a, *b) = (*from, *to);
-            }
+            self.current
+                .entry(key)
+                .and_modify(|(_, current)| {
+                    for &range in ranges.slices() {
+                        current.add(range);
+                    }
+                    current.merge();
+                })
+                .or_insert_with(|| (shadow.clone(), ranges.clone()));
         }
 
         // One write-watch asking for the copies that lie close together,
@@ -5972,7 +6006,7 @@ impl Batch {
                 .refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|(_, ranges)| ranges.slices().iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -5987,18 +6021,23 @@ impl Batch {
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
-                .map(|(shadow, from, to)| {
+                .map(|(shadow, ranges)| {
                     let copied = copied.clone();
-                    Box::new(move || { copied.fetch_add(Self::update(&shadow, from, to), Ordering::Relaxed); }) as Box<dyn FnOnce() + Send>
+                    Box::new(move || {
+                        copied.fetch_add(Self::update_ranges(&shadow, &ranges), Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
                 })
                 .collect();
             crate::shadow::wide_run(jobs);
             total = copied.load(Ordering::Relaxed);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            PREPARING[0].fetch_sub(
+                summed.saturating_sub(started.elapsed().as_micros() as u64),
+                Ordering::Relaxed,
+            );
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                total += Self::update(&shadow, from, to);
+            for (shadow, ranges) in self.refreshes.drain(..) {
+                total += Self::update_ranges(&shadow, &ranges);
             }
         }
         if ahead {
@@ -7482,6 +7521,9 @@ mod spare {
         assert!(spare.kept.is_empty());
     }
 }
+
+#[cfg(test)]
+mod disjoint_tests;
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file

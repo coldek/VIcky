@@ -75,5 +75,5 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view}
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, writing as kernel_will_write,
+    title_memory_remapping, unmap_title_memory, writing as kernel_will_write,
 };

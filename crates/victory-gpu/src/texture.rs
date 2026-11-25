@@ -586,13 +586,13 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || {
+        if let Some(changes) = waited(1, || {
             crate::watch::writes(start, start + size, self.guarded)
         }) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            if last.asked != 0 && !changes.changed_since(last.asked) {
                 return 0;
             }
-            last.asked = now;
+            last.asked = changes.now;
             let _mapped = if no_wait() {
                 let Some(mapped) = crate::watch::title_memory_reading_now() else {
                     return self.refresh_unlocked(last, size);
