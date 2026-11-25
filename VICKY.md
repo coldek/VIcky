@@ -77,11 +77,28 @@ stretches a scene records the input and output textures as they stand at present
 The floating-point images are normalized separately. The log gives their
 original ranges.
 
+### Isolating texture cost on the RTX 4060 Laptop
+
+Some texture views share the same console memory. VIcky copies between their
+host textures so a material can read pixels rendered through another view.
+On the 8 GB RTX 4060 Laptop, setting `VICTORY_ALIAS_COPY=0` at `3f797e4`
+reduced the opening street average from 3,414 to 2,023 ms/frame. The building
+and character silhouettes were visible, but surfaces lost much of their color
+and shading. Leave this switch unset for normal rendering.
+
+At `932f79b`, the copies reuse a temporary GPU buffer within a command list.
+The same street segment averaged 3,152 ms/frame, compared with 4,518 at
+`8156784` before buffer reuse. Both runs used the Series S scene path,
+driver 617.14, the 14 wave exclusions above, warm shader and pipeline caches,
+and device-removal tracing off. Each mean is the elapsed time over 24
+presented frames starting at the first captured street building. Each build
+was run once. The ground remains dark.
+
 ## Build and run
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics
-$env:VICTORY_WAVE_DEEP_SKIPS_NOT = '<the 22 hashes above>'   # no loop limit
+$env:VICTORY_WAVE_DEEP_SKIPS_NOT = '<the 14 cascade-shadow hashes above>'   # no loop limit
 target\diag\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
