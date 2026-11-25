@@ -1866,6 +1866,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The newest intermediate for texture alias copies and its capacity.
+    /// Older intermediates named before a grow stay in `kept` until reset.
+    alias_scratch: Option<(ID3D12Resource, u64)>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -5716,10 +5719,42 @@ impl HostList {
         }
     }
 
+    /// Intermediate buffer shared by this recording's texture alias copies.
+    /// The recorder leaves it in `COPY_DEST` after each use.
+    pub(crate) fn alias_scratch(&self, host: &Host, needed: u64) -> Option<ID3D12Resource> {
+        if needed == 0 {
+            return None;
+        }
+        let mut deferred = self.deferred();
+        if let Some((buffer, size)) = &deferred.alias_scratch
+            && *size >= needed
+        {
+            return Some(buffer.clone());
+        }
+        // A committed buffer already uses at least 64 KiB per allocation.
+        // Use that granularity to reuse small increases without doubling VRAM.
+        let rounded = needed.checked_next_multiple_of(64 << 10).unwrap_or(needed);
+        let (buffer, size) = match host.default_buffer(rounded) {
+            Some(buffer) => (buffer, rounded),
+            None if rounded != needed => (host.default_buffer(needed)?, needed),
+            None => return None,
+        };
+        if let Some((old, _)) = deferred.alias_scratch.replace((buffer.clone(), size)) {
+            deferred.kept.push(old.into());
+        }
+        crate::texture::ALIAS_SCRATCH_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        Some(buffer)
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Lets a texture copy that could not record try again in this list.
+    pub(crate) fn allow_texture_retry(&self, key: usize) {
+        self.deferred().textures.remove(&key);
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
@@ -6796,12 +6831,14 @@ impl Meter {
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             tracing::info!(
                 "host textures: {textures} ({:.0} MB, {:.0} MB of them used by lists), title textures sharing one {shared} (saving {:.0} MB), replacing one {replaced}; \
-                 copies between textures of one memory {:.1}/frame, depth twin copies {:.1}/frame",
+                 copies between textures of one memory {:.1}/frame, depth twin copies {:.1}/frame, \
+                 alias scratch allocations {:.1}/frame",
                 bytes as f64 / 1e6,
                 used as f64 / 1e6,
                 saved as f64 / 1e6,
                 crate::texture::ALIAS_COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
                 crate::twin::COPIES.swap(0, Ordering::Relaxed) as f64 / frames,
+                crate::texture::ALIAS_SCRATCH_ALLOCATIONS.swap(0, Ordering::Relaxed) as f64 / frames,
             );
             #[cfg(feature = "diagnostics")]
             {
@@ -7524,6 +7561,9 @@ mod spare {
 
 #[cfg(test)]
 mod disjoint_tests;
+
+#[cfg(test)]
+mod alias_scratch_tests;
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file

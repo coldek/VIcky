@@ -79,6 +79,9 @@ static STAGING: Mutex<BTreeMap<usize, Weak<HostTexture>>> = Mutex::new(BTreeMap:
 
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
 pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// New intermediate buffers for alias copies since the last frame-rate line.
+pub(crate) static ALIAS_SCRATCH_ALLOCATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Records, once per list, the copy of `from`'s host texture into `to`'s:
 /// two title textures at one memory that cannot share a host texture
@@ -159,13 +162,21 @@ pub(crate) fn alias_copy(list: &HostList, from: Arc<HostTexture>, to: This) -> b
     }
     let i = n as usize - 1;
     let f = fa[i].Footprint;
-    let total = fa[i].Offset + u64::from(f.RowPitch) * u64::from(ra[i]) * u64::from(f.Depth);
+    let Some(total) = u64::from(f.RowPitch)
+        .checked_mul(u64::from(ra[i]))
+        .and_then(|bytes| bytes.checked_mul(u64::from(f.Depth)))
+        .and_then(|bytes| fa[i].Offset.checked_add(bytes))
+    else {
+        return false;
+    };
     let source_barrier = list.move_texture(&from, COPY_SOURCE);
     // An odd key distinguishes alias copies from title-memory uploads.
-    if !list.first_use(b.as_raw() as usize | 1) && source_barrier.is_none() {
+    let key = b.as_raw() as usize | 1;
+    if !list.first_use(key) && source_barrier.is_none() {
         return true;
     }
-    let Some(buffer) = host.default_buffer(total) else {
+    let Some(buffer) = list.alias_scratch(host, total) else {
+        list.allow_texture_retry(key);
         // The state tracker already recorded this change.
         if let Some(barrier) = source_barrier {
             // SAFETY: an open list and a live texture.
@@ -173,7 +184,6 @@ pub(crate) fn alias_copy(list: &HostList, from: Arc<HostTexture>, to: This) -> b
         }
         return false;
     };
-    list.keep(&buffer);
     let before = source_barrier.map(|barrier| {
         // SAFETY: move_texture builds a transition barrier.
         let before = unsafe { barrier.Anonymous.Transition.StateBefore.0 as u32 };
@@ -211,6 +221,14 @@ pub(crate) fn alias_copy(list: &HostList, from: Arc<HostTexture>, to: This) -> b
         for i in 0..n {
             l.CopyTextureRegion(&sub(b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
         }
+        // The next copy (or a replay in the same ExecuteCommandLists call)
+        // can write here again. Across executions buffers decay to COMMON,
+        // from which the next copy implicitly promotes to COPY_DEST.
+        l.ResourceBarrier(&[crate::host::transition(
+            &buffer,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )]);
     }
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The CPU staging no longer matches what the host texture contains.
