@@ -354,6 +354,16 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// Recording-time texture work within a heap pass, in microseconds.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct HeapTextureTiming {
+    remap_us: u64,
+    queue_us: u64,
+    scan_us: u64,
+}
+
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1540,6 +1550,10 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let profile = crate::bindless::heap_pass_timing();
+        #[cfg(feature = "diagnostics")]
+        let tick = || if profile { std::time::Instant::now() } else { started };
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
         // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
@@ -1550,12 +1564,15 @@ impl State {
         static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let ranges_locked = tick();
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let full_scan = *passes % 16 == 0;
+        let slots = if full_scan {
             ranges.clear();
             host.buffer_slots()
         } else {
@@ -1600,6 +1617,8 @@ impl State {
             }
             ranges.insert(index, (shadow, address, address + len));
         }
+        #[cfg(feature = "diagnostics")]
+        let slots_cached = tick();
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
@@ -1620,8 +1639,12 @@ impl State {
         // into the opening cutscene; with every frame it ran on). The pass
         // costs some 30 ms a frame this way.
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
-        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-        let whole = whole.get_or_insert_with(Default::default);
+        #[cfg(feature = "diagnostics")]
+        let spans_folded = tick();
+        let mut whole_guard = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let whole_locked = tick();
+        let whole = whole_guard.get_or_insert_with(Default::default);
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
@@ -1644,9 +1667,18 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        #[cfg(feature = "diagnostics")]
+        let refresh_queued = tick();
+        #[cfg(feature = "diagnostics")]
+        let mut texture_timing = profile.then(HeapTextureTiming::default);
+        #[cfg(feature = "diagnostics")]
+        self.heap_textures(list, heap, host, texture_timing.as_mut());
+        #[cfg(not(feature = "diagnostics"))]
         self.heap_textures(list, heap, host);
+        let finished = std::time::Instant::now();
+        let elapsed = finished - started;
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
-        HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        HEAP_BUFFER_MICROS.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
         let seen = LOGGED.load(Ordering::Relaxed);
@@ -1657,8 +1689,31 @@ impl State {
                 views,
                 copies = spans.len(),
                 mb = bytes >> 20,
-                ms = started.elapsed().as_millis(),
+                ms = elapsed.as_millis(),
                 "buffer views of the heap made ready for shaders that pick them by index"
+            );
+        }
+        drop(whole_guard);
+        #[cfg(feature = "diagnostics")]
+        if let Some(texture) = texture_timing {
+            // The three texture timings are included in `textures_us`.
+            tracing::info!(
+                frame,
+                full_scan,
+                slots = slots.len(),
+                views,
+                copies = spans.len(),
+                total_us = elapsed.as_micros() as u64,
+                ranges_lock_us = (ranges_locked - started).as_micros() as u64,
+                cache_slots_us = (slots_cached - ranges_locked).as_micros() as u64,
+                fold_spans_us = (spans_folded - slots_cached).as_micros() as u64,
+                whole_lock_us = (whole_locked - spans_folded).as_micros() as u64,
+                defer_refresh_us = (refresh_queued - whole_locked).as_micros() as u64,
+                textures_us = (finished - refresh_queued).as_micros() as u64,
+                textures_remap_us = texture.remap_us,
+                textures_queue_us = texture.queue_us,
+                textures_scan_us = texture.scan_us,
+                "heap pass recording"
             );
         }
         Some(gpu)
@@ -1684,6 +1739,7 @@ impl State {
         list: &HostList,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
+        #[cfg(feature = "diagnostics")] mut timing: Option<&mut HeapTextureTiming>,
     ) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
@@ -1712,8 +1768,19 @@ impl State {
         let mut refused = 0;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
+        #[cfg(feature = "diagnostics")]
+        let remap_started = timing.as_ref().map(|_| std::time::Instant::now());
         host.texture_slots_remapped(frame);
+        #[cfg(feature = "diagnostics")]
+        let queue_started = timing.as_ref().map(|_| std::time::Instant::now());
         let (due, census) = host.texture_slots_due(frame, 4096);
+        #[cfg(feature = "diagnostics")]
+        if let (Some(timing), Some(remap_started), Some(queue_started)) =
+            (timing.as_mut(), remap_started, queue_started)
+        {
+            timing.remap_us = (queue_started - remap_started).as_micros() as u64;
+            timing.queue_us = queue_started.elapsed().as_micros() as u64;
+        }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1835,7 +1902,7 @@ impl State {
                 let text: String = format!("{view:?}").chars().take(300).collect();
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
-                return;
+                break;
             }
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -1868,6 +1935,10 @@ impl State {
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             host.texture_slot_done(index, write, again);
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(timing) = timing {
+            timing.scan_us = began.elapsed().as_micros() as u64;
         }
     }
 

@@ -169,6 +169,10 @@ pub(crate) enum C {
     StepHeapUs,
     StepMemoryUs,
     UploadsUs,
+    BindlessScanUs,
+    BindlessListWaitUs,
+    BindlessRegistryWaitUs,
+    BindlessExamined,
     PreludeUs,
     /// Copying back: bytes of copies compared with their snapshots, and
     /// the time.
@@ -1154,6 +1158,18 @@ pub(crate) fn log(frames: f64) {
         "disjoint shadow refreshes: {:.3} MB of gaps excluded per frame",
         mb(c[C::RefreshGaps as usize])
     );
+    if crate::bindless::heap_pass_timing() {
+        let scan = ms(c[C::BindlessScanUs as usize]);
+        tracing::info!(
+            "submission heap textures per frame: {:.0} candidates, {scan:.1} ms scanning and recording \
+             ({:.1} ms waiting for the upload list, {:.1} ms for heap registries), \
+             {:.1} ms outside the scan including pending descriptors",
+            c[C::BindlessExamined as usize],
+            ms(c[C::BindlessListWaitUs as usize]),
+            ms(c[C::BindlessRegistryWaitUs as usize]),
+            (ms(c[C::UploadsUs as usize]) - scan).max(0.0),
+        );
+    }
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \

@@ -192,7 +192,11 @@ fn left_kind(view: &View) -> usize {
 pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    #[cfg(feature = "diagnostics")]
+    let started = heap_pass_timing().then(std::time::Instant::now);
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    let list_wait = started.map_or(0, |t| t.elapsed().as_micros() as u64);
     match &guard.0 {
         // Closed by the last submission, which has run.
         Some(list) => list.reset(),
@@ -202,10 +206,18 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     let list = guard.0.as_ref()?;
     let mut recorded = false;
     let mut done = std::collections::HashSet::new();
+    #[cfg(feature = "diagnostics")]
+    let (mut registry_wait, mut uploaded) = (0, 0);
     for viewed in heaps {
         // Held while uploading: the title releasing a texture (and its
         // memory) waits in `forget`.
+        #[cfg(feature = "diagnostics")]
+        let locking = started.map(|_| std::time::Instant::now());
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        if let Some(t) = locking {
+            registry_wait += t.elapsed().as_micros() as u64;
+        }
         for &r in inner.textures.keys() {
             if !done.insert(r) {
                 continue;
@@ -217,11 +229,24 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
                 crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
                 recorded = true;
                 #[cfg(feature = "diagnostics")]
-                UPLOADED.fetch_add(1, Relaxed);
+                {
+                    uploaded += 1;
+                }
             }
         }
     }
     list.close();
+    #[cfg(feature = "diagnostics")]
+    {
+        UPLOADED.fetch_add(uploaded, Relaxed);
+        if let Some(t) = started {
+            use crate::copystat::{C, add};
+            add(C::BindlessScanUs, t.elapsed().as_micros() as u64);
+            add(C::BindlessListWaitUs, list_wait);
+            add(C::BindlessRegistryWaitUs, registry_wait);
+            add(C::BindlessExamined, done.len() as u64);
+        }
+    }
     // A list recording nothing is not run (its reset next time is fine).
     recorded.then_some(Uploads(guard))
 }
@@ -231,6 +256,13 @@ pub(crate) struct Holder(Option<HostList>);
 // SAFETY: D3D12 objects are free-threaded; the list is used by one
 // submission at a time, under the lock.
 unsafe impl Send for Holder {}
+
+/// Time the heap passes once per batch, outside individual slot operations.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn heap_pass_timing() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_TIMING").is_some_and(|v| v == "1"))
+}
 
 /// The upload list of a submission, ours until it has run.
 pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
